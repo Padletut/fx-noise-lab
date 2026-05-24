@@ -1,0 +1,14 @@
+{
+  "name": "default",
+  "base_pitch": 440,
+  "min_hz": 200,
+  "max_hz": 1200,
+  "volume": 0.8,
+  "smoothness": 0.1,
+  "gate_threshold": 0.3,
+  "trust_volume_enabled": true,
+  "spread_muted": false,
+  "regime_muted": false,
+  "noise_sensitivity": 1.0,
+  "pitch_sensitivity": 1.0
+}
