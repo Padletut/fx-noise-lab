@@ -26,8 +26,12 @@ class MainWindow(ctk.CTk):
         self.status_widgets = {}
         self.chart_canvas = None
         self.chart_info_label = None
+        self.chart_zoom_label = None
         self.chart_data = None
         self._chart_bounds = (0, 0, 0, 0)
+        self._chart_visible_range = (0, 0)
+        self._chart_zoom = 1.0
+        self._chart_view_center_index = 0
         self.pair_controls = {"A": {}, "B": {}}
         self.playback_widgets = {}
         self._is_closing = False
@@ -156,13 +160,54 @@ class MainWindow(ctk.CTk):
             text="Market View",
             font=ctk.CTkFont(size=13, weight="bold"),
         ).pack(side="left")
+
+        zoom_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        zoom_frame.pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            zoom_frame,
+            text="<",
+            width=30,
+            command=lambda: self._pan_chart(-1),
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            zoom_frame,
+            text="-",
+            width=30,
+            command=self._zoom_chart_out,
+        ).pack(side="left", padx=2)
+        self.chart_zoom_label = ctk.CTkLabel(
+            zoom_frame,
+            text="Fit",
+            width=42,
+            font=ctk.CTkFont(size=11),
+        )
+        self.chart_zoom_label.pack(side="left", padx=2)
+        ctk.CTkButton(
+            zoom_frame,
+            text="+",
+            width=30,
+            command=self._zoom_chart_in,
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            zoom_frame,
+            text=">",
+            width=30,
+            command=lambda: self._pan_chart(1),
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            zoom_frame,
+            text="Fit",
+            width=42,
+            command=self._fit_chart,
+        ).pack(side="left", padx=2)
+
         self.chart_info_label = ctk.CTkLabel(
             header_frame,
             text="Load CSV to view chart",
             font=ctk.CTkFont(size=11),
             anchor="e",
         )
-        self.chart_info_label.pack(side="right", fill="x", expand=True)
+        self.chart_info_label.pack(side="right", fill="x", expand=True, padx=(8, 0))
 
         self.chart_canvas = Canvas(
             chart_frame,
@@ -172,6 +217,9 @@ class MainWindow(ctk.CTk):
         )
         self.chart_canvas.pack(fill="x", padx=8, pady=(0, 8))
         self.chart_canvas.bind("<Configure>", lambda _event: self._draw_chart_static())
+        self.chart_canvas.bind("<MouseWheel>", self._on_chart_mousewheel)
+        self.chart_canvas.bind("<Button-4>", self._on_chart_mousewheel)
+        self.chart_canvas.bind("<Button-5>", self._on_chart_mousewheel)
 
     def _create_pair_controls(self, panel, pair_name: str):
         """Create controls for a pair panel."""
@@ -461,6 +509,137 @@ class MainWindow(ctk.CTk):
         slider.pack(side="left", fill="x", expand=True, padx=8)
         return slider
 
+    def _get_chart_points(self) -> list[dict]:
+        """Return the active chart points."""
+        return (self.chart_data or {}).get("points", [])
+
+    def _clamp_chart_index(self, index: int) -> int:
+        """Clamp an index to the active chart range."""
+        points = self._get_chart_points()
+        if not points:
+            return 0
+        return max(0, min(int(index), len(points) - 1))
+
+    def _visible_chart_count(self, total_points: int) -> int:
+        """Return how many points should be visible for the current zoom."""
+        if total_points <= 0:
+            return 0
+        min_visible = min(total_points, 20)
+        visible_count = int(round(total_points / max(self._chart_zoom, 1.0)))
+        return max(min_visible, min(total_points, visible_count))
+
+    def _get_chart_visible_range(self, points: list[dict]) -> tuple[int, int]:
+        """Return the start/end slice for the active chart viewport."""
+        total_points = len(points)
+        if total_points == 0:
+            self._chart_visible_range = (0, 0)
+            return self._chart_visible_range
+
+        if self._chart_zoom <= 1.01:
+            self._chart_visible_range = (0, total_points)
+            return self._chart_visible_range
+
+        visible_count = self._visible_chart_count(total_points)
+        center_index = self._clamp_chart_index(self._chart_view_center_index)
+        start_index = int(round(center_index - (visible_count / 2)))
+        start_index = max(0, min(start_index, total_points - visible_count))
+        self._chart_visible_range = (start_index, start_index + visible_count)
+        return self._chart_visible_range
+
+    def _update_chart_zoom_label(self):
+        """Refresh the chart zoom indicator."""
+        if self.chart_zoom_label is None:
+            return
+
+        points = self._get_chart_points()
+        if not points or self._chart_zoom <= 1.01:
+            self.chart_zoom_label.configure(text="Fit")
+            return
+
+        start_index, end_index = self._chart_visible_range
+        visible_count = max(end_index - start_index, 1)
+        self.chart_zoom_label.configure(
+            text=f"{len(points) / visible_count:.1f}x"
+        )
+
+    def _set_chart_zoom(self, zoom_value: float, center_index: int | None = None):
+        """Set chart zoom and redraw around a center point."""
+        points = self._get_chart_points()
+        if not points:
+            return
+
+        min_visible = min(len(points), 20)
+        max_zoom = max(1.0, len(points) / max(min_visible, 1))
+        self._chart_zoom = max(1.0, min(float(zoom_value), max_zoom))
+        if center_index is None:
+            center_index = self._chart_view_center_index
+        self._chart_view_center_index = self._clamp_chart_index(center_index)
+        self._draw_chart_static()
+
+    def _zoom_chart_in(self):
+        """Zoom into the chart."""
+        center_index = self.controller.current_event_index
+        if self._chart_zoom > 1.01:
+            center_index = self._chart_view_center_index
+        self._set_chart_zoom(self._chart_zoom * 1.6, center_index)
+
+    def _zoom_chart_out(self):
+        """Zoom out of the chart."""
+        self._set_chart_zoom(self._chart_zoom / 1.6, self._chart_view_center_index)
+
+    def _fit_chart(self):
+        """Show the full chart range."""
+        self._chart_zoom = 1.0
+        self._chart_view_center_index = self._clamp_chart_index(
+            self.controller.current_event_index
+        )
+        self._draw_chart_static()
+
+    def _pan_chart(self, direction: int):
+        """Move the chart viewport left or right."""
+        points = self._get_chart_points()
+        if not points:
+            return
+
+        start_index, end_index = self._chart_visible_range
+        visible_count = max(end_index - start_index, 1)
+        step = max(1, visible_count // 3)
+        center_index = self._chart_view_center_index + (int(direction) * step)
+        self._set_chart_zoom(self._chart_zoom, center_index)
+
+    def _chart_index_at_canvas_x(self, x_position: int) -> int:
+        """Map a canvas X coordinate to the nearest visible chart index."""
+        points = self._get_chart_points()
+        if not points:
+            return 0
+
+        start_index, end_index = self._chart_visible_range
+        left, _top, right, _bottom = self._chart_bounds
+        if right <= left or end_index <= start_index:
+            return self._clamp_chart_index(self.controller.current_event_index)
+
+        fraction = (float(x_position) - left) / (right - left)
+        fraction = max(0.0, min(fraction, 1.0))
+        visible_span = max(end_index - start_index - 1, 0)
+        return self._clamp_chart_index(
+            start_index + int(round(fraction * visible_span))
+        )
+
+    def _on_chart_mousewheel(self, event):
+        """Zoom the chart from the mouse wheel."""
+        points = self._get_chart_points()
+        if not points:
+            return "break"
+
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            delta = 1 if getattr(event, "num", None) == 4 else -1
+
+        center_index = self._chart_index_at_canvas_x(getattr(event, "x", 0))
+        zoom_factor = 1.25 if delta > 0 else 1 / 1.25
+        self._set_chart_zoom(self._chart_zoom * zoom_factor, center_index)
+        return "break"
+
     def _price_to_y(self, value: float, price_min: float, price_max: float) -> float:
         """Map a price-like value into the chart canvas Y coordinate."""
         _left, top, _right, bottom = self._chart_bounds
@@ -486,10 +665,20 @@ class MainWindow(ctk.CTk):
     def _refresh_chart_data(self):
         """Reload chart data from the controller and redraw the chart."""
         self.chart_data = self.controller.get_chart_data()
+        points = self._get_chart_points()
+        if points:
+            current_index = self._clamp_chart_index(
+                self.chart_data.get("current_index", 0)
+            )
+            if self._chart_zoom <= 1.01:
+                self._chart_view_center_index = current_index
+            else:
+                self._chart_view_center_index = self._clamp_chart_index(
+                    self._chart_view_center_index
+                )
         self._draw_chart_static()
-        self._update_chart_playhead(self.chart_data.get("current_index", 0))
 
-    def _draw_chart_static(self):
+    def _draw_chart_static(self, update_playhead: bool = True):
         """Draw the static chart layer."""
         if self.chart_canvas is None:
             return
@@ -503,6 +692,8 @@ class MainWindow(ctk.CTk):
 
         points = (self.chart_data or {}).get("points", [])
         if not points:
+            self._chart_visible_range = (0, 0)
+            self._update_chart_zoom_label()
             self.chart_canvas.create_text(
                 width / 2,
                 height / 2,
@@ -512,8 +703,14 @@ class MainWindow(ctk.CTk):
             )
             return
 
-        lows = [point["low"] for point in points]
-        highs = [point["high"] for point in points]
+        start_index, end_index = self._get_chart_visible_range(points)
+        visible_points = points[start_index:end_index]
+        if not visible_points:
+            self._update_chart_zoom_label()
+            return
+
+        lows = [point["low"] for point in visible_points]
+        highs = [point["high"] for point in visible_points]
         price_min = min(lows)
         price_max = max(highs)
         if price_max <= price_min:
@@ -524,14 +721,14 @@ class MainWindow(ctk.CTk):
             y = top + (grid_index / 4) * (bottom - top)
             self.chart_canvas.create_line(left, y, right, y, fill="#25313a")
 
-        point_count = len(points)
+        point_count = len(visible_points)
         step = (right - left) / max(point_count - 1, 1)
         body_width = max(1, min(8, step * 0.65))
         intensity_top = bottom + 8
         intensity_bottom = height - 12
 
-        for index, point in enumerate(points):
-            x = self._index_to_x(index, point_count)
+        for offset, point in enumerate(visible_points):
+            x = self._index_to_x(offset, point_count)
             intensity_color = self._intensity_color(point["intensity"])
             self.chart_canvas.create_rectangle(
                 x - max(step / 2, 0.5),
@@ -563,7 +760,9 @@ class MainWindow(ctk.CTk):
             else:
                 self.chart_canvas.create_line(x, bottom, x, close_y, fill=candle_color)
 
-        self._update_chart_playhead((self.chart_data or {}).get("current_index", 0))
+        self._update_chart_zoom_label()
+        if update_playhead:
+            self._update_chart_playhead((self.chart_data or {}).get("current_index", 0))
 
     def _update_chart_playhead(self, event_index=0):
         """Move the playhead and current-row info on the chart."""
@@ -580,7 +779,32 @@ class MainWindow(ctk.CTk):
             index = 0
         index = max(0, min(index, len(points) - 1))
         point = points[index]
-        x = self._index_to_x(index, len(points))
+        start_index, end_index = self._chart_visible_range
+        is_playing = self.controller.playback.is_playing()
+        is_paused = self.controller.playback.is_paused()
+
+        if self._chart_zoom > 1.01 and is_playing and not is_paused:
+            visible_count = max(end_index - start_index, 1)
+            edge_margin = max(2, int(visible_count * 0.15))
+            if index < start_index + edge_margin or index >= end_index - edge_margin:
+                self._chart_view_center_index = index
+                self._draw_chart_static(update_playhead=False)
+                start_index, end_index = self._chart_visible_range
+
+        if index < start_index or index >= end_index:
+            self.chart_canvas.delete("playhead")
+            if self.chart_info_label is not None:
+                self.chart_info_label.configure(
+                    text=(
+                        f"{point['timestamp']} | close {point['close']:.5f} | "
+                        f"spread {point['spread']:.2f} | "
+                        f"vol {point['volatility']:.2f} | "
+                        f"intensity {point['intensity']:.2f}"
+                    )
+                )
+            return
+
+        x = self._index_to_x(index - start_index, max(end_index - start_index, 1))
         left, top, right, bottom = self._chart_bounds
 
         self.chart_canvas.delete("playhead")
@@ -708,6 +932,8 @@ class MainWindow(ctk.CTk):
             self._status_vars["rows"] = f"Rows: {metadata['rows']}"
         self._status_vars["state"] = "Ready to play"
         self._update_status_display()
+        self._chart_zoom = 1.0
+        self._chart_view_center_index = 0
         self._refresh_chart_data()
 
     def _update_pair_options(self, pair_options):
@@ -860,6 +1086,7 @@ class MainWindow(ctk.CTk):
 
         self._status_vars["state"] = "Playback: running"
         self._update_status_display()
+        self._chart_view_center_index = self.controller.current_event_index
         self._update_chart_playhead(self.controller.current_event_index)
 
     def _on_pause(self):
@@ -881,7 +1108,8 @@ class MainWindow(ctk.CTk):
 
         self._status_vars["state"] = "Playback: stopped"
         self._update_status_display()
-        self._update_chart_playhead(0)
+        self._chart_view_center_index = 0
+        self._draw_chart_static()
 
     def _on_record(self):
         """Handle record button presses."""
