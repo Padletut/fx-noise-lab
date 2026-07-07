@@ -6,6 +6,8 @@ FX Noise Lab is an experimental sonification tool for backtest-style market data
 
 - Load CSV files from the GUI with an `Open CSV` button
 - Map `quality`, `volatility`, `trust`, `spread`, `trade_eligible`, and `regime` into audio
+- Load OHLCV candles or dense ask/bid tick CSVs
+- View a synchronized market chart with playhead and audio-intensity overlay
 - Filter rows by `pair`, `pair_a`, and `pair_b` when those columns exist
 - Play generated audio in `Single` or `Stereo` mode
 - Change playback speed from `0.25x` to `8x`
@@ -47,6 +49,8 @@ Basic flow:
 Recognized fields:
 
 - `timestamp`
+- OHLCV: `open`, `high`, `low`, `close`, `volume`
+- Tick: `askPrice`, `bidPrice`, `askVolume`, `bidVolume`
 - `quality` or `quality_score`
 - `volatility`
 - `trust` or `trust_value`
@@ -58,6 +62,9 @@ Recognized fields:
 - `pair_b`
 
 Boolean fields such as `trade_eligible` accept values like `true`, `false`, `1`, and `0`.
+
+Tick CSVs are compressed into time buckets before audio rendering so large files do not
+create one audio event per tick.
 
 ## Audio Mapping
 

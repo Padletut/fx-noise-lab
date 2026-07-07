@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from tkinter import BooleanVar, StringVar, filedialog
+from tkinter import BooleanVar, Canvas, StringVar, TclError, filedialog
 
 import customtkinter as ctk
 
@@ -24,8 +24,15 @@ class MainWindow(ctk.CTk):
         self._status_vars = {}
         self.status_label = None
         self.status_widgets = {}
+        self.chart_canvas = None
+        self.chart_info_label = None
+        self.chart_data = None
+        self._chart_bounds = (0, 0, 0, 0)
         self.pair_controls = {"A": {}, "B": {}}
         self.playback_widgets = {}
+        self._is_closing = False
+        self._status_poll_after_id = None
+        self._live_audio_refresh_after_id = None
 
         self.loop_var = BooleanVar(value=self.controller.loop_enabled)
         self.trust_volume_var = BooleanVar(
@@ -48,6 +55,7 @@ class MainWindow(ctk.CTk):
         self._create_status_bar()
         self._create_controls()
         self._sync_controls_from_settings()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_runtime_status()
 
     def _create_menu(self):
@@ -108,18 +116,62 @@ class MainWindow(ctk.CTk):
         control_container = ctk.CTkFrame(self, fg_color="#3a3a3a", corner_radius=10)
         control_container.pack(fill="both", expand=True, padx=10, pady=10)
 
-        left_panel = ctk.CTkFrame(control_container, fg_color="#4a4a4a", corner_radius=8)
-        left_panel.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        left_panel = ctk.CTkFrame(
+            control_container,
+            fg_color="#4a4a4a",
+            width=250,
+            corner_radius=8,
+        )
+        left_panel.pack(side="left", fill="y", padx=5, pady=5)
 
-        right_panel = ctk.CTkFrame(control_container, fg_color="#4a4a4a", corner_radius=8)
-        right_panel.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+        right_panel = ctk.CTkFrame(
+            control_container,
+            fg_color="#4a4a4a",
+            width=250,
+            corner_radius=8,
+        )
+        right_panel.pack(side="right", fill="y", padx=5, pady=5)
 
-        center_panel = ctk.CTkFrame(control_container, fg_color="#5a5a5a", corner_radius=8)
-        center_panel.pack(side="bottom", fill="x", pady=5)
+        center_panel = ctk.CTkFrame(
+            control_container,
+            fg_color="#5a5a5a",
+            corner_radius=8,
+        )
+        center_panel.pack(side="left", fill="both", expand=True, padx=5, pady=5)
 
         self._create_pair_controls(left_panel, "A")
         self._create_pair_controls(right_panel, "B")
+        self._create_chart_panel(center_panel)
         self._create_playback_controls(center_panel)
+
+    def _create_chart_panel(self, parent):
+        """Create the market chart and playback playhead display."""
+        chart_frame = ctk.CTkFrame(parent, fg_color="#20262b", corner_radius=6)
+        chart_frame.pack(fill="x", padx=5, pady=5)
+
+        header_frame = ctk.CTkFrame(chart_frame, fg_color="transparent")
+        header_frame.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(
+            header_frame,
+            text="Market View",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(side="left")
+        self.chart_info_label = ctk.CTkLabel(
+            header_frame,
+            text="Load CSV to view chart",
+            font=ctk.CTkFont(size=11),
+            anchor="e",
+        )
+        self.chart_info_label.pack(side="right", fill="x", expand=True)
+
+        self.chart_canvas = Canvas(
+            chart_frame,
+            height=230,
+            bg="#111418",
+            highlightthickness=0,
+        )
+        self.chart_canvas.pack(fill="x", padx=8, pady=(0, 8))
+        self.chart_canvas.bind("<Configure>", lambda _event: self._draw_chart_static())
 
     def _create_pair_controls(self, panel, pair_name: str):
         """Create controls for a pair panel."""
@@ -409,6 +461,193 @@ class MainWindow(ctk.CTk):
         slider.pack(side="left", fill="x", expand=True, padx=8)
         return slider
 
+    def _price_to_y(self, value: float, price_min: float, price_max: float) -> float:
+        """Map a price-like value into the chart canvas Y coordinate."""
+        _left, top, _right, bottom = self._chart_bounds
+        if price_max <= price_min:
+            return (top + bottom) / 2
+        return bottom - ((value - price_min) / (price_max - price_min)) * (bottom - top)
+
+    def _index_to_x(self, index: int, point_count: int) -> float:
+        """Map a chart row index into the chart canvas X coordinate."""
+        left, _top, right, _bottom = self._chart_bounds
+        if point_count <= 1:
+            return (left + right) / 2
+        return left + (index / (point_count - 1)) * (right - left)
+
+    def _intensity_color(self, value: float) -> str:
+        """Return a dark blue color scaled by audio intensity."""
+        clamped_value = max(0.0, min(float(value), 1.0))
+        red = int(20 + clamped_value * 20)
+        green = int(31 + clamped_value * 70)
+        blue = int(45 + clamped_value * 130)
+        return f"#{red:02x}{green:02x}{blue:02x}"
+
+    def _refresh_chart_data(self):
+        """Reload chart data from the controller and redraw the chart."""
+        self.chart_data = self.controller.get_chart_data()
+        self._draw_chart_static()
+        self._update_chart_playhead(self.chart_data.get("current_index", 0))
+
+    def _draw_chart_static(self):
+        """Draw the static chart layer."""
+        if self.chart_canvas is None:
+            return
+
+        self.chart_canvas.delete("all")
+        width = max(self.chart_canvas.winfo_width(), 640)
+        height = max(self.chart_canvas.winfo_height(), 220)
+        left, right = 48, width - 14
+        top, bottom = 16, height - 42
+        self._chart_bounds = (left, top, right, bottom)
+
+        points = (self.chart_data or {}).get("points", [])
+        if not points:
+            self.chart_canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Load CSV to view market chart",
+                fill="#9aa7b2",
+                font=("TkDefaultFont", 11),
+            )
+            return
+
+        lows = [point["low"] for point in points]
+        highs = [point["high"] for point in points]
+        price_min = min(lows)
+        price_max = max(highs)
+        if price_max <= price_min:
+            price_min -= 0.5
+            price_max += 0.5
+
+        for grid_index in range(5):
+            y = top + (grid_index / 4) * (bottom - top)
+            self.chart_canvas.create_line(left, y, right, y, fill="#25313a")
+
+        point_count = len(points)
+        step = (right - left) / max(point_count - 1, 1)
+        body_width = max(1, min(8, step * 0.65))
+        intensity_top = bottom + 8
+        intensity_bottom = height - 12
+
+        for index, point in enumerate(points):
+            x = self._index_to_x(index, point_count)
+            intensity_color = self._intensity_color(point["intensity"])
+            self.chart_canvas.create_rectangle(
+                x - max(step / 2, 0.5),
+                intensity_top,
+                x + max(step / 2, 0.5),
+                intensity_bottom,
+                fill=intensity_color,
+                outline="",
+            )
+
+            open_y = self._price_to_y(point["open"], price_min, price_max)
+            high_y = self._price_to_y(point["high"], price_min, price_max)
+            low_y = self._price_to_y(point["low"], price_min, price_max)
+            close_y = self._price_to_y(point["close"], price_min, price_max)
+            up_color = "#4cc38a"
+            down_color = "#f06d5f"
+            candle_color = up_color if point["close"] >= point["open"] else down_color
+
+            if self.chart_data.get("chart_type") == "candles":
+                self.chart_canvas.create_line(x, high_y, x, low_y, fill="#94a3ad")
+                self.chart_canvas.create_rectangle(
+                    x - body_width / 2,
+                    min(open_y, close_y),
+                    x + body_width / 2,
+                    max(open_y, close_y) + 1,
+                    fill=candle_color,
+                    outline=candle_color,
+                )
+            else:
+                self.chart_canvas.create_line(x, bottom, x, close_y, fill=candle_color)
+
+        self._update_chart_playhead((self.chart_data or {}).get("current_index", 0))
+
+    def _update_chart_playhead(self, event_index=0):
+        """Move the playhead and current-row info on the chart."""
+        if self.chart_canvas is None or not self.chart_data:
+            return
+
+        points = self.chart_data.get("points", [])
+        if not points:
+            return
+
+        try:
+            index = int(event_index)
+        except (TypeError, ValueError):
+            index = 0
+        index = max(0, min(index, len(points) - 1))
+        point = points[index]
+        x = self._index_to_x(index, len(points))
+        left, top, right, bottom = self._chart_bounds
+
+        self.chart_canvas.delete("playhead")
+        self.chart_canvas.create_line(
+            x,
+            top,
+            x,
+            bottom + 30,
+            fill="#f6d365",
+            width=2,
+            tags="playhead",
+        )
+        self.chart_canvas.create_rectangle(
+            max(left, x - 4),
+            top,
+            min(right, x + 4),
+            bottom,
+            outline="#f6d365",
+            tags="playhead",
+        )
+
+        if self.chart_info_label is not None:
+            self.chart_info_label.configure(
+                text=(
+                    f"{point['timestamp']} | close {point['close']:.5f} | "
+                    f"spread {point['spread']:.2f} | vol {point['volatility']:.2f} | "
+                    f"intensity {point['intensity']:.2f}"
+                )
+            )
+
+    def _schedule_live_audio_refresh(self):
+        """Debounce a live audio re-render while playback is running."""
+        if self._is_closing:
+            return
+        if not self.controller.playback.is_playing():
+            return
+        if self.controller.playback.is_paused():
+            return
+
+        if self._live_audio_refresh_after_id is not None:
+            try:
+                self.after_cancel(self._live_audio_refresh_after_id)
+            except (TclError, ValueError):
+                pass
+
+        self._live_audio_refresh_after_id = self.after(
+            350,
+            self._run_live_audio_refresh,
+        )
+
+    def _run_live_audio_refresh(self):
+        """Apply current slider settings to active playback."""
+        self._live_audio_refresh_after_id = None
+        try:
+            did_refresh = self.controller.refresh_active_playback()
+        except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover
+            self._status_vars["state"] = f"Live update failed: {exc}"
+            self._update_status_display()
+            return
+
+        if did_refresh:
+            self._status_vars["state"] = "Playback: updated"
+            self._update_status_display()
+        else:
+            self._status_vars["state"] = "Playback: restart needed for this change"
+            self._update_status_display()
+
     def _sync_controls_from_settings(self):
         """Populate the UI from the controller's active settings."""
         global_settings = self.controller.get_settings()
@@ -432,10 +671,14 @@ class MainWindow(ctk.CTk):
 
     def _poll_runtime_status(self):
         """Refresh the runtime status box on a timer."""
+        if self._is_closing:
+            return
+
         snapshot = self.controller.get_runtime_status()
         for key, label in self.status_widgets.items():
             label.configure(text=snapshot.get(key, "-"))
-        self.after(200, self._poll_runtime_status)
+        self._update_chart_playhead(snapshot.get("event_index", 0))
+        self._status_poll_after_id = self.after(200, self._poll_runtime_status)
 
     def _on_open_file(self):
         """Open a CSV file and load it into the controller."""
@@ -457,9 +700,15 @@ class MainWindow(ctk.CTk):
 
         self._update_pair_options(metadata["pair_options"])
         self._status_vars["file"] = f"Loaded: {metadata['file_path']}"
-        self._status_vars["rows"] = f"Rows: {metadata['rows']}"
+        if metadata.get("processed_rows") != metadata["rows"]:
+            self._status_vars["rows"] = (
+                f"Rows: {metadata['rows']} -> audio: {metadata['processed_rows']}"
+            )
+        else:
+            self._status_vars["rows"] = f"Rows: {metadata['rows']}"
         self._status_vars["state"] = "Ready to play"
         self._update_status_display()
+        self._refresh_chart_data()
 
     def _update_pair_options(self, pair_options):
         """Update combo-box options after data load."""
@@ -474,24 +723,29 @@ class MainWindow(ctk.CTk):
         self.controller.set_pair_selection(pair_name, choice)
         self._status_vars[f"{pair_name}_pair"] = f"Pair {pair_name}: {choice}"
         self._update_status_display()
+        self._refresh_chart_data()
+        self._schedule_live_audio_refresh()
 
     def _on_mode_change(self, mode: str):
         """Handle playback mode changes."""
         self.controller.set_playback_mode(mode)
         self._status_vars["mode"] = f"Mode: {mode}"
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_speed_change(self, speed: str):
         """Handle playback speed changes."""
         self.controller.set_playback_speed(speed)
         self._status_vars["speed"] = f"Speed: {speed}"
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_render_mode_change(self, mode: str):
         """Handle render-mode changes."""
         self.controller.set_render_mode(mode)
         self._status_vars["render"] = f"Render: {mode}"
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_loop_toggle(self):
         """Handle loop toggles."""
@@ -508,6 +762,7 @@ class MainWindow(ctk.CTk):
             "Pair B: active" if self.right_channel_var.get() else "Pair B: muted"
         )
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_volume_change(self, pair_name: str, value: float):
         """Handle volume slider changes."""
@@ -516,6 +771,7 @@ class MainWindow(ctk.CTk):
             f"Pair {pair_name} volume: {value / 100:.0%}"
         )
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_pitch_change(self, pair_name: str, value: float):
         """Handle pitch sensitivity changes."""
@@ -524,6 +780,7 @@ class MainWindow(ctk.CTk):
             f"Pair {pair_name} pitch: {value:.0f}/10"
         )
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_noise_change(self, pair_name: str, value: float):
         """Handle noise sensitivity changes."""
@@ -532,24 +789,28 @@ class MainWindow(ctk.CTk):
             f"Pair {pair_name} noise: {value:.0f}%"
         )
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_base_pitch_change(self, value: float):
         """Handle base-pitch slider changes."""
         self.controller.set_base_pitch(value)
         self._status_vars["base_pitch"] = f"Base pitch: {value:.0f} Hz"
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_smoothness_change(self, value: float):
         """Handle smoothing changes."""
         self.controller.set_smoothness_percent(value)
         self._status_vars["smooth"] = f"Smoothness: {value:.0f}%"
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_gate_change(self, value: float):
         """Handle gate-threshold changes."""
         self.controller.set_gate_threshold_percent(value)
         self._status_vars["gate"] = f"Gate: {value:.0f}%"
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_trust_toggle(self):
         """Handle trust-to-volume toggles."""
@@ -560,6 +821,7 @@ class MainWindow(ctk.CTk):
             else "Trust->Volume: off"
         )
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_spread_toggle(self):
         """Handle spread-layer mute toggles."""
@@ -570,6 +832,7 @@ class MainWindow(ctk.CTk):
             else "Spread layer: active"
         )
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_regime_toggle(self):
         """Handle regime-layer mute toggles."""
@@ -580,6 +843,7 @@ class MainWindow(ctk.CTk):
             else "Regime layer: active"
         )
         self._update_status_display()
+        self._schedule_live_audio_refresh()
 
     def _on_api_key_change(self, *_args):
         """Handle API key entry changes."""
@@ -596,6 +860,7 @@ class MainWindow(ctk.CTk):
 
         self._status_vars["state"] = "Playback: running"
         self._update_status_display()
+        self._update_chart_playhead(self.controller.current_event_index)
 
     def _on_pause(self):
         """Handle pause/resume button presses."""
@@ -616,6 +881,7 @@ class MainWindow(ctk.CTk):
 
         self._status_vars["state"] = "Playback: stopped"
         self._update_status_display()
+        self._update_chart_playhead(0)
 
     def _on_record(self):
         """Handle record button presses."""
@@ -631,6 +897,28 @@ class MainWindow(ctk.CTk):
             self._status_vars["state"] = "Recording armed"
 
         self._update_status_display()
+
+    def _on_close(self):
+        """Stop runtime resources before closing the Tk window."""
+        if self._is_closing:
+            return
+
+        self._is_closing = True
+        if self._status_poll_after_id is not None:
+            try:
+                self.after_cancel(self._status_poll_after_id)
+            except (TclError, ValueError):
+                pass
+            self._status_poll_after_id = None
+        if self._live_audio_refresh_after_id is not None:
+            try:
+                self.after_cancel(self._live_audio_refresh_after_id)
+            except (TclError, ValueError):
+                pass
+            self._live_audio_refresh_after_id = None
+
+        self.controller.shutdown()
+        self.destroy()
 
     def _update_status_display(self):
         """Refresh the status-bar text."""

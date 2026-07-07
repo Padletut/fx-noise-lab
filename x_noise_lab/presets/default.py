@@ -16,7 +16,7 @@ FALLBACK_DEFAULT_PRESET = {
     "max_hz": 1200,
     "volume": 0.8,
     "smoothness": 0.1,
-    "gate_threshold": 0.3,
+    "gate_threshold": 0.0,
     "trust_volume_enabled": True,
     "spread_muted": False,
     "regime_muted": False,

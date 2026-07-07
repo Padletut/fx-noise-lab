@@ -73,6 +73,8 @@ class SonificationController:
         self.selected_pairs = {"A": "All", "B": "All"}
         self._playback_events = []
         self._event_duration_seconds = 0.0
+        self.current_event_index = 0
+        self._is_shutdown = False
         self.current_playback_snapshot = self._empty_playback_snapshot()
 
         self.playback.set_loop(self.loop_enabled)
@@ -97,6 +99,7 @@ class SonificationController:
                 int(playback_time / self._event_duration_seconds),
                 len(self._playback_events) - 1,
             )
+            self.current_event_index = event_index
             self.current_playback_snapshot = self._playback_events[event_index].copy()
 
         self.current_playback_snapshot["playback_time"] = f"{playback_time:.2f}s"
@@ -122,7 +125,129 @@ class SonificationController:
         """Return the latest playback status for the GUI."""
         snapshot = self.current_playback_snapshot.copy()
         snapshot["playback_time"] = f"{self.playback.get_current_timestamp():.2f}s"
+        snapshot["event_index"] = self.current_event_index
         return snapshot
+
+    def _to_numeric_array(self, values, default_value: float = 0.0) -> np.ndarray:
+        """Convert values to a finite float array."""
+        numeric = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(
+            dtype=float
+        )
+        return np.nan_to_num(
+            numeric,
+            nan=default_value,
+            posinf=default_value,
+            neginf=default_value,
+        )
+
+    def _get_chart_series(self, raw_dataframe: pd.DataFrame) -> Dict[str, np.ndarray]:
+        """Return OHLC-style chart arrays for the processed dataset."""
+        source_format = (
+            self.processed_data.get("source_format", "features")
+            if self.processed_data is not None
+            else "features"
+        )
+
+        if source_format == "tick" and "mid_price" in raw_dataframe.columns:
+            close_values = self._to_numeric_array(raw_dataframe["mid_price"])
+            return {
+                "open": self._to_numeric_array(
+                    raw_dataframe.get("mid_open", raw_dataframe["mid_price"])
+                ),
+                "high": self._to_numeric_array(
+                    raw_dataframe.get("mid_max", raw_dataframe["mid_price"])
+                ),
+                "low": self._to_numeric_array(
+                    raw_dataframe.get("mid_min", raw_dataframe["mid_price"])
+                ),
+                "close": close_values,
+                "chart_type": "candles",
+            }
+
+        has_ohlc = all(
+            column in raw_dataframe.columns
+            for column in ("open", "high", "low", "close")
+        )
+        if has_ohlc:
+            return {
+                "open": self._to_numeric_array(raw_dataframe["open"]),
+                "high": self._to_numeric_array(raw_dataframe["high"]),
+                "low": self._to_numeric_array(raw_dataframe["low"]),
+                "close": self._to_numeric_array(raw_dataframe["close"]),
+                "chart_type": "candles",
+            }
+
+        quality_values = (
+            self.processed_data["quality"]
+            if self.processed_data is not None
+            else np.array([], dtype=float)
+        )
+        quality_values = np.asarray(quality_values, dtype=float)
+        return {
+            "open": quality_values,
+            "high": quality_values,
+            "low": quality_values,
+            "close": quality_values,
+            "chart_type": "bars",
+        }
+
+    def get_chart_data(self) -> Dict:
+        """Return chart-ready data synchronized with the current playback index."""
+        if self.processed_data is None:
+            return {
+                "points": [],
+                "current_index": 0,
+                "source_format": "none",
+                "chart_type": "bars",
+            }
+
+        raw_dataframe = self.processed_data["raw_df"]
+        chart_series = self._get_chart_series(raw_dataframe)
+        close_values = np.asarray(chart_series["close"], dtype=float)
+        row_count = len(close_values)
+        if row_count == 0:
+            return {
+                "points": [],
+                "current_index": 0,
+                "source_format": self.processed_data.get("source_format", "features"),
+                "chart_type": chart_series["chart_type"],
+            }
+
+        trust = np.asarray(self.processed_data["trust"], dtype=float)
+        spread = np.asarray(self.processed_data["spread"], dtype=float)
+        volatility = np.asarray(self.processed_data["volatility"], dtype=float)
+        trade_eligible = np.asarray(self.processed_data["trade_eligible"], dtype=bool)
+        intensity = np.clip((trust * 0.45) + (volatility * 0.35) + (spread * 0.20), 0, 1)
+        intensity = np.where(trade_eligible, intensity, 0.0)
+
+        timestamps = (
+            raw_dataframe["timestamp"].tolist()
+            if "timestamp" in raw_dataframe.columns
+            else [None] * row_count
+        )
+        points = []
+        for index in range(row_count):
+            points.append(
+                {
+                    "timestamp": self._format_timestamp(timestamps[index]),
+                    "open": float(chart_series["open"][index]),
+                    "high": float(chart_series["high"][index]),
+                    "low": float(chart_series["low"][index]),
+                    "close": float(chart_series["close"][index]),
+                    "spread": float(spread[index]),
+                    "volatility": float(volatility[index]),
+                    "trust": float(trust[index]),
+                    "intensity": float(intensity[index]),
+                    "trade_eligible": bool(trade_eligible[index]),
+                }
+            )
+
+        return {
+            "points": points,
+            "current_index": min(self.current_event_index, row_count - 1),
+            "source_format": self.processed_data.get("source_format", "features"),
+            "chart_type": chart_series["chart_type"],
+        }
 
     def set_pair_volume_percent(self, slot: str, value: float):
         """Map a 0-100 UI slider to a slot-specific volume multiplier."""
@@ -229,11 +354,18 @@ class SonificationController:
         self.processed_data = self.data_loader.process_backtest_data(dataframe)
         self.last_audio_buffer = np.array([], dtype=np.float32)
         self.selected_pairs = {"A": "All", "B": "All"}
+        self.current_event_index = 0
         self.current_playback_snapshot = self._empty_playback_snapshot()
+        processed_rows = int(
+            self.processed_data.get("processed_rows", len(dataframe))
+        )
 
         return {
             "file_path": self.current_file.name,
             "rows": len(dataframe),
+            "processed_rows": processed_rows,
+            "source_format": self.processed_data.get("source_format", "features"),
+            "tick_bucket_ms": self.processed_data.get("tick_bucket_ms"),
             "columns": list(dataframe.columns),
             "pair_options": self.get_pair_options(),
         }
@@ -254,6 +386,22 @@ class SonificationController:
             raise RuntimeError(f"Pair {slot} selection did not match any rows.")
 
         return dataframe
+
+    def _get_processed_data_for_slot(self, slot: str) -> Dict:
+        """Return processed data for a slot, reusing full-data processing."""
+        if self.raw_dataframe is None:
+            raise RuntimeError("Load a CSV file before starting playback.")
+
+        selected_pair = self.selected_pairs[slot]
+        pair_column = self._get_pair_column(slot, self.raw_dataframe)
+        if selected_pair == "All" and self.processed_data is not None:
+            return self.processed_data
+
+        if pair_column is None and self.processed_data is not None:
+            return self.processed_data
+
+        filtered_dataframe = self._get_filtered_dataframe_for_slot(slot)
+        return self.data_loader.process_backtest_data(filtered_dataframe)
 
     def _build_market_row(self, processed: Dict, index: int) -> Dict:
         """Build a renderable market-data row from processed arrays."""
@@ -383,8 +531,7 @@ class SonificationController:
         duration_ms: int,
     ) -> list[tuple[np.ndarray, Dict]]:
         """Render all chunk events for one slot."""
-        filtered_dataframe = self._get_filtered_dataframe_for_slot(slot)
-        processed = self.data_loader.process_backtest_data(filtered_dataframe)
+        processed = self._get_processed_data_for_slot(slot)
         slot_settings = self._build_slot_settings(slot)
         slot_rows = [
             self._build_market_row(processed, index)
@@ -492,11 +639,54 @@ class SonificationController:
         duration_ms = len(audio_buffer) / self.sample_rate * 1000.0
         self.last_recording_path = None
         if self._playback_events:
+            self.current_event_index = 0
             self.current_playback_snapshot = self._playback_events[0].copy()
             self.current_playback_snapshot["playback_time"] = "0.00s"
         else:
             self.current_playback_snapshot = self._empty_playback_snapshot()
         self.playback.start(audio_buffer, duration_ms)
+
+    def refresh_active_playback(self) -> bool:
+        """Re-render audio with current settings and keep the playback position."""
+        if self.raw_dataframe is None or not self.playback.is_playing():
+            return False
+        if self.playback.is_paused():
+            return False
+
+        playback_time = self.playback.get_current_timestamp()
+        previous_events = self._playback_events
+        previous_event_duration_seconds = self._event_duration_seconds
+        previous_audio_buffer = self.last_audio_buffer
+        previous_event_index = self.current_event_index
+        previous_snapshot = self.current_playback_snapshot.copy()
+
+        audio_buffer = self.build_audio_buffer()
+        duration_ms = len(audio_buffer) / self.sample_rate * 1000.0
+
+        if self._playback_events and self._event_duration_seconds > 0:
+            self.current_event_index = min(
+                int(playback_time / self._event_duration_seconds),
+                len(self._playback_events) - 1,
+            )
+            self.current_playback_snapshot = self._playback_events[
+                self.current_event_index
+            ].copy()
+            self.current_playback_snapshot["playback_time"] = f"{playback_time:.2f}s"
+
+        did_replace = self.playback.replace_data(
+            audio_buffer,
+            duration_ms,
+            start_seconds=playback_time,
+        )
+        if did_replace:
+            return True
+
+        self._playback_events = previous_events
+        self._event_duration_seconds = previous_event_duration_seconds
+        self.last_audio_buffer = previous_audio_buffer
+        self.current_event_index = previous_event_index
+        self.current_playback_snapshot = previous_snapshot
+        return False
 
     def pause(self):
         """Pause the active playback session."""
@@ -505,6 +695,7 @@ class SonificationController:
     def stop(self) -> Optional[str]:
         """Stop playback and finalize any active recording."""
         self.playback.stop()
+        self.current_event_index = 0
         if self.recorder.is_recording():
             self.last_recording_path = self.recorder.stop_recording()
         self.current_playback_snapshot["playback_time"] = (
@@ -528,3 +719,15 @@ class SonificationController:
     def is_recording(self) -> bool:
         """Return whether recording is active."""
         return self.recorder.is_recording()
+
+    def shutdown(self) -> Optional[str]:
+        """Release runtime resources before the GUI or process exits."""
+        if self._is_shutdown:
+            return self.last_recording_path
+
+        self._is_shutdown = True
+        self.playback.stop(wait=False, abort=False)
+        if self.recorder.is_recording():
+            self.last_recording_path = self.recorder.stop_recording()
+        recording_path = self.last_recording_path
+        return recording_path

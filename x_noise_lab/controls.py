@@ -21,7 +21,7 @@ class ControlsManager:
             "noise_sensitivity": 1.0,
             "pitch_sensitivity": 1.0,
             "smoothness": 0.1,
-            "gate_threshold": 0.3,
+            "gate_threshold": 0.0,
             "trust_volume_enabled": True,
             "spread_muted": False,
             "regime_muted": False,
